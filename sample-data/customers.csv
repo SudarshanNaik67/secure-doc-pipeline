@@ -1,0 +1,4 @@
+id,name,email,card_number,ssn
+1,John Smith,john.smith@example.com,5555-5555-5555-4444,111-22-3333
+2,Mary Major,mary.major@example.org,3782 822463 10005,123-45-6789
+3,Order ref (not a card),n/a,1234 5678 9012 3456,000-00-0000

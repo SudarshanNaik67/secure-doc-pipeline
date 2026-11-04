@@ -1,0 +1,269 @@
+# Secrets are NOT stored in this file. Create them first (see README):
+#   kubectl -n doc-pipeline create secret generic pipeline-secrets ...
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: doc-pipeline
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: doc-pipeline
+data:
+  MONGODB_DB: "dlp_pipeline"
+  BOX_MOCK_MODE: "true"              # "true" = no Box account needed; "false" = real Box
+  BOX_PARENT_FOLDER_ID: "0"          # "0" = root of the Box account
+  DLP_BLOCK_ON_FINDINGS: "false"     # "true" rejects files containing PII
+  MAX_UPLOAD_BYTES: "5242880"
+---
+# ============================ box-service ================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: box-service
+  namespace: doc-pipeline
+  labels:
+    app: box-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: box-service
+  template:
+    metadata:
+      labels:
+        app: box-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000              # the "node" user in node:alpine
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: box-service
+          image: box-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: MAX_FILE_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: MAX_UPLOAD_BYTES
+            - name: BOX_MOCK_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: BOX_MOCK_MODE
+            - name: BOX_PARENT_FOLDER_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: BOX_PARENT_FOLDER_ID
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: INTERNAL_API_KEY
+            # Box credentials (only needed when BOX_MOCK_MODE=false):
+            # provide EITHER the developer token OR the CCG trio.
+            - name: BOX_DEVELOPER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: BOX_DEVELOPER_TOKEN
+                  optional: true
+            - name: BOX_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: BOX_CLIENT_ID
+                  optional: true
+            - name: BOX_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: BOX_CLIENT_SECRET
+                  optional: true
+            - name: BOX_ENTERPRISE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: BOX_ENTERPRISE_ID
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 300m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# Internal-only Service: reachable in-cluster as http://box-service:3000
+apiVersion: v1
+kind: Service
+metadata:
+  name: box-service
+  namespace: doc-pipeline
+spec:
+  type: ClusterIP
+  selector:
+    app: box-service
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+# ========================== scanner-service ==============================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scanner-service
+  namespace: doc-pipeline
+  labels:
+    app: scanner-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scanner-service
+  template:
+    metadata:
+      labels:
+        app: scanner-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scanner-service
+          image: scanner-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: BOX_SERVICE_URL
+              value: "http://box-service:3000"   # cluster-internal DNS name
+            - name: MONGODB_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: MONGODB_DB
+            - name: DLP_BLOCK_ON_FINDINGS
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: DLP_BLOCK_ON_FINDINGS
+            - name: MAX_UPLOAD_BYTES
+              valueFrom:
+                configMapKeyRef:
+                  name: pipeline-config
+                  key: MAX_UPLOAD_BYTES
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: MONGODB_URI
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: INTERNAL_API_KEY
+            - name: INGEST_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pipeline-secrets
+                  key: INGEST_API_KEY
+                  optional: true
+          readinessProbe:               # also verifies MongoDB connectivity
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp                 # Starlette spools large uploads to /tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Entry point for clients (NodePort so Minikube can expose it locally)
+apiVersion: v1
+kind: Service
+metadata:
+  name: scanner-service
+  namespace: doc-pipeline
+spec:
+  type: NodePort
+  selector:
+    app: scanner-service
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30080
+---
+# Zero-trust: only scanner-service pods may call box-service.
+# (Enforced when the CNI supports NetworkPolicy, e.g. Calico/Cilium.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: box-service-allow-scanner-only
+  namespace: doc-pipeline
+spec:
+  podSelector:
+    matchLabels:
+      app: box-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: scanner-service
+      ports:
+        - protocol: TCP
+          port: 3000

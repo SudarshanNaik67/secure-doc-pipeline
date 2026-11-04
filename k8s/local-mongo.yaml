@@ -1,0 +1,59 @@
+# OPTIONAL - for local Minikube demos only (data is lost when the pod restarts).
+# Use MongoDB Atlas (free M0) for anything persistent.
+#
+#   kubectl apply -f k8s/local-mongo.yaml
+#   then set MONGODB_URI=mongodb://mongo:27017 in the pipeline-secrets Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: doc-pipeline
+  labels:
+    app: mongo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          ports:
+            - containerPort: 27017
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: doc-pipeline
+spec:
+  type: ClusterIP
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017

@@ -1,0 +1,59 @@
+# One-command local stack:   docker compose up --build
+#
+#   mongo            -> local MongoDB 7 (no Atlas account needed)
+#   box-service      -> Node/TypeScript Box integration (BOX_MOCK_MODE=true by default)
+#   scanner-service  -> Python/FastAPI DLP scanner (the public entry point)
+#
+# Every value below has a safe default, so no .env file is required.
+# Copy .env.example to .env to override (e.g. to use real Box or MongoDB Atlas).
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  box-service:
+    build: ./box-service
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+      BOX_MOCK_MODE: ${BOX_MOCK_MODE:-true}
+      BOX_DEVELOPER_TOKEN: ${BOX_DEVELOPER_TOKEN:-}
+      BOX_CLIENT_ID: ${BOX_CLIENT_ID:-}
+      BOX_CLIENT_SECRET: ${BOX_CLIENT_SECRET:-}
+      BOX_ENTERPRISE_ID: ${BOX_ENTERPRISE_ID:-}
+      BOX_PARENT_FOLDER_ID: ${BOX_PARENT_FOLDER_ID:-0}
+    ports:
+      # Published only so you can read back mock files in a demo.
+      # In Kubernetes this service is cluster-internal (no external port).
+      - "3000:3000"
+
+  scanner-service:
+    build: ./scanner-service
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      box-service:
+        condition: service_started
+    environment:
+      # Defaults to the bundled Mongo container; set MONGODB_URI in .env for Atlas.
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017}
+      MONGODB_DB: ${MONGODB_DB:-dlp_pipeline}
+      BOX_SERVICE_URL: http://box-service:3000
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+      INGEST_API_KEY: ${INGEST_API_KEY:-}
+      DLP_BLOCK_ON_FINDINGS: ${DLP_BLOCK_ON_FINDINGS:-false}
+    ports:
+      - "8000:8000"
+
+volumes:
+  mongo-data:

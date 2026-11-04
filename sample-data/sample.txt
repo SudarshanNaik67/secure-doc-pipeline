@@ -1,0 +1,6 @@
+Customer record - CONFIDENTIAL
+Name:  Jane Doe
+Email: jane.doe@example.com
+Card:  4111 1111 1111 1111
+SSN:   123-45-6789
+AWS key found in config: AKIAIOSFODNN7EXAMPLE
