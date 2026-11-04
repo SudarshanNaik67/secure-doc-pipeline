@@ -1,0 +1,132 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scanner-service:
+    name: Scanner service (lint + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scanner-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scanner-service/requirements*.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Unit tests (pytest)
+        run: python -m pytest -v
+
+  box-service:
+    name: Box service (typecheck + test + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: box-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: box-service/package-lock.json
+      - run: npm ci
+      - name: Typecheck (lint)
+        run: npm run lint
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
+  validate-k8s:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+      - name: Validate against Kubernetes schemas
+        run: ./kubeconform -strict -summary k8s-deployment.yaml k8s/local-mongo.yaml
+
+  build-images:
+    name: Build image (${{ matrix.service }})
+    needs: [scanner-service, box-service, validate-k8s]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [scanner-service, box-service]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/${{ matrix.service }}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR (main branch only)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy (simulated)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-images
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render manifest with immutable image tags
+        run: |
+          PREFIX="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sed -e "s|image: scanner-service:local|image: ${PREFIX}/scanner-service:${GITHUB_SHA}|" \
+              -e "s|image: box-service:local|image: ${PREFIX}/box-service:${GITHUB_SHA}|" \
+              -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Always|" \
+              k8s-deployment.yaml > rendered.yaml
+          echo "--- Rendered image references ---"
+          grep -n "image:" rendered.yaml
+
+      - name: Simulated rollout
+        run: |
+          echo "Would run: kubectl apply -f rendered.yaml"
+          echo "Would run: kubectl -n doc-pipeline rollout status deployment/box-service --timeout=120s"
+          echo "Would run: kubectl -n doc-pipeline rollout status deployment/scanner-service --timeout=120s"
+          echo "Simulated deployment of ${GITHUB_SHA} to staging complete."
